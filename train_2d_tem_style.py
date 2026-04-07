@@ -73,39 +73,121 @@ def make_observation(state_id, observation_map, n_x, device):
     return observation
 
 
-def build_tem_batch(batch_size, rollout_length, n_x, device):
-    observation_maps = [sample_observation_map(n_x) for _ in range(batch_size)]
-    batch_walks = [sample_walk(rollout_length) for _ in range(batch_size)]
+def sample_walk_length(rollout_length, walk_length_min_chunks, walk_length_max_chunks):
+    return rollout_length * random.randint(walk_length_min_chunks, walk_length_max_chunks)
 
+
+def make_env_state(rollout_length, n_x, walk_length_min_chunks, walk_length_max_chunks):
+    walk_length = sample_walk_length(
+        rollout_length=rollout_length,
+        walk_length_min_chunks=walk_length_min_chunks,
+        walk_length_max_chunks=walk_length_max_chunks,
+    )
+    states, actions = sample_walk(walk_length)
+    return {
+        "observation_map": sample_observation_map(n_x),
+        "states": states,
+        "actions": actions,
+        "position": 0,
+        "visited": [False for _ in range(NUM_STATES)],
+    }
+
+
+def maybe_refresh_observation_map(env_state, n_x, remap_strategy, remap_probability):
+    if remap_strategy == "fixed":
+        return
+    if remap_strategy == "resample":
+        env_state["observation_map"] = sample_observation_map(n_x)
+        return
+    if remap_strategy == "curriculum" and random.random() < remap_probability:
+        env_state["observation_map"] = sample_observation_map(n_x)
+        return
+    if remap_strategy not in {"fixed", "resample", "curriculum"}:
+        raise ValueError(f"Unknown remap strategy: {remap_strategy}")
+
+
+def refresh_walk(
+    env_state,
+    rollout_length,
+    n_x,
+    walk_length_min_chunks,
+    walk_length_max_chunks,
+    remap_strategy,
+    remap_probability,
+):
+    maybe_refresh_observation_map(
+        env_state=env_state,
+        n_x=n_x,
+        remap_strategy=remap_strategy,
+        remap_probability=remap_probability,
+    )
+    walk_length = sample_walk_length(
+        rollout_length=rollout_length,
+        walk_length_min_chunks=walk_length_min_chunks,
+        walk_length_max_chunks=walk_length_max_chunks,
+    )
+    states, actions = sample_walk(walk_length)
+    env_state["states"] = states
+    env_state["actions"] = actions
+    env_state["position"] = 0
+    env_state["visited"] = [False for _ in range(NUM_STATES)]
+
+
+def build_persistent_tem_batch(
+    env_states,
+    prev_iter,
+    rollout_length,
+    n_x,
+    device,
+    remap_strategy,
+    remap_probability,
+    walk_length_min_chunks,
+    walk_length_max_chunks,
+):
     chunk = []
     next_state_labels = []
 
-    for step_index in range(rollout_length):
-        locations = []
-        observations = []
-        actions = []
-        next_states = []
+    for env_index, env_state in enumerate(env_states):
+        remaining_steps = len(env_state["actions"]) - env_state["position"]
+        if remaining_steps < rollout_length:
+            refresh_walk(
+                env_state=env_state,
+                rollout_length=rollout_length,
+                n_x=n_x,
+                walk_length_min_chunks=walk_length_min_chunks,
+                walk_length_max_chunks=walk_length_max_chunks,
+                remap_strategy=remap_strategy,
+                remap_probability=remap_probability,
+            )
+            if prev_iter is not None:
+                prev_iter[0].a[env_index] = None
 
-        for env_index in range(batch_size):
-            states, walk_actions = batch_walks[env_index]
-            current_state = states[step_index]
-            next_state = states[step_index + 1]
-            action = walk_actions[step_index]
+        for step_index in range(rollout_length):
+            position = env_state["position"]
+            current_state = env_state["states"][position]
+            next_state = env_state["states"][position + 1]
+            action = env_state["actions"][position]
 
-            locations.append(make_location(current_state))
-            observations.append(
+            if len(chunk) < rollout_length:
+                chunk.append([[], [], []])
+                next_state_labels.append([])
+
+            chunk[step_index][0].append(make_location(current_state))
+            chunk[step_index][1].append(
                 make_observation(
                     current_state,
-                    observation_maps[env_index],
+                    env_state["observation_map"],
                     n_x,
                     device,
                 )
             )
-            actions.append(action)
-            next_states.append(next_state)
+            chunk[step_index][2].append(action)
+            next_state_labels[step_index].append(next_state)
+            env_state["position"] += 1
 
-        chunk.append([locations, torch.stack(observations, dim=0), actions])
-        next_state_labels.append(torch.tensor(next_states, device=device, dtype=torch.long))
+    for step_index in range(rollout_length):
+        chunk[step_index][1] = torch.stack(chunk[step_index][1], dim=0)
+        next_state_labels[step_index] = torch.tensor(next_state_labels[step_index], device=device, dtype=torch.long)
 
     return chunk, next_state_labels
 
@@ -152,6 +234,10 @@ def train(
     rollout_length=20,
     supervised_weight=1.0,
     tem_weight=1.0,
+    remap_strategy="fixed",
+    remap_curriculum_steps=1000,
+    walk_length_min_chunks=5,
+    walk_length_max_chunks=15,
     checkpoint_path="tem_2d_style.pt",
     checkpoint_every=250,
     seed=0,
@@ -172,6 +258,16 @@ def train(
     params["train_it"] = train_steps
     optimizer = torch.optim.Adam(predictor.parameters(), lr=params["lr_max"])
     supervised_criterion = nn.CrossEntropyLoss()
+    env_states = [
+        make_env_state(
+            rollout_length=rollout_length,
+            n_x=tem.hyper["n_x"],
+            walk_length_min_chunks=walk_length_min_chunks,
+            walk_length_max_chunks=walk_length_max_chunks,
+        )
+        for _ in range(batch_size)
+    ]
+    prev_iter = None
 
     for train_step in range(train_steps):
         eta_new, lambda_new, p2g_scale_offset, lr, _, loss_weights = parameters.parameter_iteration(train_step, params)
@@ -179,29 +275,39 @@ def train(
         tem.hyper["lambda"] = lambda_new
         tem.hyper["p2g_scale_offset"] = p2g_scale_offset
         loss_weights = loss_weights.to(device)
+        remap_probability = (
+            min((train_step + 1) / max(remap_curriculum_steps, 1), 1.0)
+            if remap_strategy == "curriculum"
+            else 0.0
+        )
 
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        chunk, next_state_labels = build_tem_batch(
-            batch_size=batch_size,
+        chunk, next_state_labels = build_persistent_tem_batch(
+            env_states=env_states,
+            prev_iter=prev_iter,
             rollout_length=rollout_length,
             n_x=tem.hyper["n_x"],
             device=device,
+            remap_strategy=remap_strategy,
+            remap_probability=remap_probability,
+            walk_length_min_chunks=walk_length_min_chunks,
+            walk_length_max_chunks=walk_length_max_chunks,
         )
 
         optimizer.zero_grad()
-        forward = tem(chunk, prev_iter=None)
+        forward = tem(chunk, prev_iter=prev_iter)
 
         tem_loss = torch.tensor(0.0, device=device)
         supervised_loss = torch.tensor(0.0, device=device)
         accuracy_correct = 0
         accuracy_total = 0
-        visited = [[False for _ in range(NUM_STATES)] for _ in range(batch_size)]
 
         for step_index, step in enumerate(forward):
             step_loss = []
-            for env_index, env_visited in enumerate(visited):
+            for env_index, env_state in enumerate(env_states):
+                env_visited = env_state["visited"]
                 state_id = step.g[env_index]["id"]
                 if env_visited[state_id]:
                     step_loss.append(loss_weights * torch.stack([loss_component[env_index] for loss_component in step.L]))
@@ -224,6 +330,7 @@ def train(
 
         total_loss.backward()
         optimizer.step()
+        prev_iter = [forward[-1].detach()]
 
         if train_step % 10 == 0 or train_step == train_steps - 1:
             accuracy = 100.0 * accuracy_correct / max(accuracy_total, 1)
@@ -233,6 +340,7 @@ def train(
                 f"| tem={tem_loss.item():.4f} "
                 f"| sup={supervised_loss.item():.4f} "
                 f"| acc={accuracy:.2f}% "
+                f"| remap_p={remap_probability:.2f} "
                 f"| device={device}"
             )
 
@@ -246,6 +354,10 @@ def train(
                         "rollout_length": rollout_length,
                         "supervised_weight": supervised_weight,
                         "tem_weight": tem_weight,
+                        "remap_strategy": remap_strategy,
+                        "remap_curriculum_steps": remap_curriculum_steps,
+                        "walk_length_min_chunks": walk_length_min_chunks,
+                        "walk_length_max_chunks": walk_length_max_chunks,
                         "seed": seed,
                     },
                 },
@@ -262,6 +374,10 @@ def parse_args():
     parser.add_argument("--rollout-length", type=int, default=20)
     parser.add_argument("--supervised-weight", type=float, default=1.0)
     parser.add_argument("--tem-weight", type=float, default=1.0)
+    parser.add_argument("--remap-strategy", type=str, default="fixed", choices=["fixed", "resample", "curriculum"])
+    parser.add_argument("--remap-curriculum-steps", type=int, default=1000)
+    parser.add_argument("--walk-length-min-chunks", type=int, default=5)
+    parser.add_argument("--walk-length-max-chunks", type=int, default=15)
     parser.add_argument("--checkpoint-path", type=str, default="tem_2d_style.pt")
     parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
@@ -277,6 +393,10 @@ if __name__ == "__main__":
         rollout_length=args.rollout_length,
         supervised_weight=args.supervised_weight,
         tem_weight=args.tem_weight,
+        remap_strategy=args.remap_strategy,
+        remap_curriculum_steps=args.remap_curriculum_steps,
+        walk_length_min_chunks=args.walk_length_min_chunks,
+        walk_length_max_chunks=args.walk_length_max_chunks,
         checkpoint_path=args.checkpoint_path,
         checkpoint_every=args.checkpoint_every,
         seed=args.seed,
