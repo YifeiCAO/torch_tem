@@ -50,6 +50,28 @@ class SupervisedTEMTransition(nn.Module):
         return logits, g_next_flat
 
 
+def build_supervised_model(batch_size=64, num_states=16, device="cpu"):
+    params = parameters.parameters()
+    params["has_static_action"] = False
+    params["batch_size"] = batch_size
+
+    tem = model.Model(params).to(device)
+    supervised_model = SupervisedTEMTransition(tem_model=tem, num_states=num_states).to(device)
+    return supervised_model
+
+
+def load_supervised_model(checkpoint_path, batch_size=64, num_states=16, device="cpu"):
+    supervised_model = build_supervised_model(
+        batch_size=batch_size,
+        num_states=num_states,
+        device=device,
+    )
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    supervised_model.load_state_dict(state_dict)
+    supervised_model.eval()
+    return supervised_model
+
+
 def train(
     num_epochs=20,
     num_samples=4096,
@@ -61,12 +83,11 @@ def train(
     # Keep training on CPU: the original TEM implementation creates CPU tensors internally.
     device = torch.device("cpu")
 
-    params = parameters.parameters()
-    params["has_static_action"] = False
-    params["batch_size"] = batch_size
-
-    tem = model.Model(params).to(device)
-    supervised_model = SupervisedTEMTransition(tem_model=tem, num_states=16).to(device)
+    supervised_model = build_supervised_model(
+        batch_size=batch_size,
+        num_states=16,
+        device=device,
+    )
 
     dataset = Wine2DDataset(num_samples=num_samples)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
