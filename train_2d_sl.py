@@ -15,6 +15,13 @@ from dataset_wine_2d import Wine2DDataset
 class SupervisedTEMTransition(nn.Module):
     """Wrap the TEM transition model with a state encoder and classifier."""
 
+    INVERSE_ACTION = {
+        0: 1,  # up -> down
+        1: 0,  # down -> up
+        2: 3,  # left -> right
+        3: 2,  # right -> left
+    }
+
     def __init__(self, tem_model, num_states=16):
         super().__init__()
         self.tem = tem_model
@@ -38,14 +45,22 @@ class SupervisedTEMTransition(nn.Module):
             start = stop
         return g_modules
 
-    def forward(self, current_state_index, action_index):
-        g_current_flat = self.state_embedding(current_state_index)
-        g_current = self._split_g(g_current_flat)
+    def encode_state(self, state_index):
+        return self.state_embedding(state_index)
 
-        # TEM expects actions as a Python list of integer labels for the batch.
+    def transition_g(self, g_flat, action_index):
+        g_current = self._split_g(g_flat)
         action_list = action_index.detach().cpu().tolist()
         g_next = self.tem.f_mu_g_path(action_list, g_current)
-        g_next_flat = torch.cat(g_next, dim=1)
+        return torch.cat(g_next, dim=1)
+
+    def inverse_action(self, action_index):
+        inverse = [self.INVERSE_ACTION[int(action)] for action in action_index.detach().cpu().tolist()]
+        return torch.tensor(inverse, device=action_index.device, dtype=action_index.dtype)
+
+    def forward(self, current_state_index, action_index):
+        g_current_flat = self.encode_state(current_state_index)
+        g_next_flat = self.transition_g(g_current_flat, action_index)
         logits = self.classifier(g_next_flat)
         return logits, g_next_flat
 
@@ -77,6 +92,8 @@ def train(
     num_samples=4096,
     batch_size=64,
     learning_rate=1e-3,
+    latent_consistency_weight=0.1,
+    cycle_consistency_weight=0.1,
 ):
     torch.manual_seed(0)
 
@@ -92,12 +109,16 @@ def train(
     dataset = Wine2DDataset(num_samples=num_samples)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    criterion = nn.CrossEntropyLoss()
+    classification_criterion = nn.CrossEntropyLoss()
+    consistency_criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(supervised_model.parameters(), lr=learning_rate)
 
     supervised_model.train()
     for epoch in range(num_epochs):
-        epoch_loss = 0.0
+        epoch_total_loss = 0.0
+        epoch_classification_loss = 0.0
+        epoch_latent_loss = 0.0
+        epoch_cycle_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
 
@@ -108,21 +129,50 @@ def train(
 
             optimizer.zero_grad()
 
-            logits, _ = supervised_model(current_state, action)
-            loss = criterion(logits, next_state)
-            loss.backward()
+            logits, g_next_pred = supervised_model(current_state, action)
+            classification_loss = classification_criterion(logits, next_state)
+
+            g_next_target = supervised_model.encode_state(next_state)
+            latent_consistency_loss = consistency_criterion(
+                g_next_pred,
+                g_next_target,
+            )
+
+            inverse_action = supervised_model.inverse_action(action)
+            cycle_reconstruction = supervised_model.transition_g(g_next_pred, inverse_action)
+            cycle_consistency_loss = consistency_criterion(
+                cycle_reconstruction,
+                supervised_model.encode_state(current_state),
+            )
+
+            total_loss = (
+                classification_loss
+                + latent_consistency_weight * latent_consistency_loss
+                + cycle_consistency_weight * cycle_consistency_loss
+            )
+
+            total_loss.backward()
             optimizer.step()
 
             batch_size_actual = current_state.size(0)
-            epoch_loss += loss.item() * batch_size_actual
+            epoch_total_loss += total_loss.item() * batch_size_actual
+            epoch_classification_loss += classification_loss.item() * batch_size_actual
+            epoch_latent_loss += latent_consistency_loss.item() * batch_size_actual
+            epoch_cycle_loss += cycle_consistency_loss.item() * batch_size_actual
             epoch_total += batch_size_actual
             epoch_correct += (logits.argmax(dim=1) == next_state).sum().item()
 
-        mean_loss = epoch_loss / epoch_total
+        mean_total_loss = epoch_total_loss / epoch_total
+        mean_classification_loss = epoch_classification_loss / epoch_total
+        mean_latent_loss = epoch_latent_loss / epoch_total
+        mean_cycle_loss = epoch_cycle_loss / epoch_total
         accuracy = 100.0 * epoch_correct / epoch_total
         print(
             f"Epoch {epoch + 1:03d}/{num_epochs:03d} "
-            f"| loss={mean_loss:.4f} "
+            f"| total={mean_total_loss:.4f} "
+            f"| ce={mean_classification_loss:.4f} "
+            f"| latent={mean_latent_loss:.4f} "
+            f"| cycle={mean_cycle_loss:.4f} "
             f"| acc={accuracy:.2f}%"
         )
 
