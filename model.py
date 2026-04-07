@@ -168,18 +168,19 @@ class Model(torch.nn.Module):
     def init_iteration(self, g, x, a, M):
         # On the very first iteration, update the batch size based on the data. This is useful when doing analysis on the network with different batch sizes compared to training
         self.hyper['batch_size'] = x.shape[0]
+        device = x.device
         # Initalise hebbian memory connectivity matrix [M_gen, M_inf] if it wasn't initialised yet
         if M is None:
             # Create new empty memory dict for generative network: zero connectivity matrix M_0, then empty list of the memory vectors a and b for each iteration for efficient hebbian memory computation
-            M = [torch.zeros((self.hyper['batch_size'],sum(self.hyper['n_p']),sum(self.hyper['n_p'])), dtype=torch.float)]
+            M = [torch.zeros((self.hyper['batch_size'],sum(self.hyper['n_p']),sum(self.hyper['n_p'])), dtype=torch.float, device=device)]
             # Append inference memory only if memory is used in grounded location inference
             if self.hyper['use_p_inf']:
                 # If inference and generative network share common memory: reuse same connectivity, and same memory vectors. Else, create a new empty memory list for inference network
-                M.append(M[0] if self.hyper['common_memory'] else torch.zeros((self.hyper['batch_size'],sum(self.hyper['n_p']),sum(self.hyper['n_p'])), dtype=torch.float)) 
+                M.append(M[0] if self.hyper['common_memory'] else torch.zeros((self.hyper['batch_size'],sum(self.hyper['n_p']),sum(self.hyper['n_p'])), dtype=torch.float, device=device)) 
         # Initialise previous abstract location by stacking abstract location prior
         g_inf = [torch.stack([self.g_init[f] for _ in range(self.hyper['batch_size'])]) for f in range(self.hyper['n_f'])]
         # Initialise previous sensory experience with zeros, as there is no data yet for temporal smoothing
-        x_inf = [torch.zeros((self.hyper['batch_size'], self.hyper['n_x_f'][f])) for f in range(self.hyper['n_f'])]        
+        x_inf = [torch.zeros((self.hyper['batch_size'], self.hyper['n_x_f'][f]), device=device) for f in range(self.hyper['n_f'])]        
         # And construct new iteration for that g, x, a, and M
         return Iteration(g=g, x=x, a=a, M=M, x_inf=x_inf, g_inf=g_inf)    
     
@@ -198,7 +199,7 @@ class Model(torch.nn.Module):
                         g_inf[a_i,:] = self.g_init[f]
                     # Reset the sensory experience for this walk
                     for f, x_inf in enumerate(prev_iter[0].x_inf):
-                        x_inf[a_i,:] = torch.zeros(self.hyper['n_x_f'][f])
+                        x_inf[a_i,:] = torch.zeros(self.hyper['n_x_f'][f], device=x_inf.device)
         # Return the iteration with reset parameters (or simply the empty array if prev_iter was empty)
         return prev_iter
                     
@@ -276,7 +277,7 @@ class Model(torch.nn.Module):
         shiny_envs = [location['shiny'] is not None for location in locations]
         if any(shiny_envs):            
             # Find for which environments the current location has a shiny object
-            shiny_locations = torch.unsqueeze(torch.stack([torch.tensor(location['shiny'], dtype=torch.float) for location in locations if location['shiny'] is not None]), dim=-1)
+            shiny_locations = torch.unsqueeze(torch.stack([torch.tensor(location['shiny'], dtype=torch.float, device=mu_g[0].device) for location in locations if location['shiny'] is not None]), dim=-1)
             # Get abstract location for environments with shiny objects and feed to each of the object vector cell modules
             mu_g_shiny = self.f_mu_g_shiny([shiny_locations for _ in range(self.hyper['n_f_g'] if self.hyper['separate_ovc'] else self.hyper['n_f'])])
             sigma_g_shiny = self.f_sigma_g_shiny([shiny_locations for _ in range(self.hyper['n_f_g'] if self.hyper['separate_ovc'] else self.hyper['n_f'])])
@@ -338,17 +339,19 @@ class Model(torch.nn.Module):
     def f_mu_g_path(self, a_prev, g_prev, no_direc=None):
         # If there are no environments where the transition direction needs to be omitted (e.g. no shiny objects, or in inference model: set to all false
         no_direc = [False for _ in a_prev] if no_direc is None else no_direc
+        device = g_prev[0].device
         # Remove all Nones from a_prev: these are walks where there was no previous action, so no step needs to be calculated for those
         a_prev_step = [a if a is not None else 0 for a in a_prev]
         # And also keep track of which walks these valid step actions are for
         a_do_step = [a != None for a in a_prev]        
+        action_tensor = torch.tensor(a_prev_step, device=device)
         # Transform list of actions into batch of one-hot row vectors. 
         if self.hyper['has_static_action']:
             # If this world has static actions: whenever action 0 (standing still) appears, the action vector should be all zeros. All other actions should have a 1 in the label-1 entry
-            a = torch.zeros((len(a_prev_step),self.hyper['n_actions'])).scatter_(1, torch.clamp(torch.tensor(a_prev_step).unsqueeze(1)-1,min=0), 1.0*(torch.tensor(a_prev_step).unsqueeze(1)>0))
+            a = torch.zeros((len(a_prev_step),self.hyper['n_actions']), device=device).scatter_(1, torch.clamp(action_tensor.unsqueeze(1)-1,min=0), 1.0*(action_tensor.unsqueeze(1)>0))
         else:
             # Without static actions: each action label should become a one-hot vector for that label
-            a = torch.zeros((len(a_prev_step),self.hyper['n_actions'])).scatter_(1, torch.tensor(a_prev_step).unsqueeze(1), 1.0)
+            a = torch.zeros((len(a_prev_step),self.hyper['n_actions']), device=device).scatter_(1, action_tensor.unsqueeze(1), 1.0)
         # Get vector of transition weights by feeding actions into MLP        
         D_a = self.MLP_D_a([a for _ in range(self.hyper['n_f'])])
         # Replace transition weights by non-directional transition weights in environments where transition direction needs to be omitted (can set only if any no_direc)
@@ -453,7 +456,7 @@ class Model(torch.nn.Module):
         # Apply activation function to initial memory index
         h_t = self.f_p(h_t)        
         # Hierarchical retrieval (not in paper) is implemented by early stopping retrieval for low frequencies, using a mask. If not specified: initialise mask as all 1s
-        retrieve_it_mask = [torch.ones(sum(self.hyper['n_p'])) for _ in range(self.hyper['n_p'])] if retrieve_it_mask is None else retrieve_it_mask
+        retrieve_it_mask = [torch.ones(sum(self.hyper['n_p']), device=h_t.device) for _ in range(self.hyper['n_p'])] if retrieve_it_mask is None else retrieve_it_mask
         # Iterate attractor dynamics to do pattern completion
         for tau in range(self.hyper['i_attractor']):
             # Apply one iteration of attractor dynamics, but only where there is a 1 in the mask. NB retrieve_it_mask entries have only one row, but are broadcasted to batch_size
